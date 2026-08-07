@@ -840,15 +840,34 @@ void MultiMergedStratumServer::HandleSubscribe(int client_id, const std::string&
     SendToClient(client_id, oss.str());
 }
 
-// ── Bitcoin stratum: mining.authorize ─────────────────────────────────────────
-// Login format same as XMRig: "PARENT_ADDR+WTX_ADDR.worker" or "PARENT_ADDR.worker"
-void MultiMergedStratumServer::HandleAuthorize(int client_id, const std::string& id,
-                                                const std::vector<std::string>& params) {
-    std::string login = params.size() >= 1 ? params[0] : "";
+// Work out where a miner's WATTx rewards should go.
+//
+// Accepted, in order of preference:
+//   1. the login, as "PARENT_ADDR+WTX_ADDR.worker" -- the canonical form;
+//   2. the stratum PASSWORD field -- which is what the public mining
+//      instructions have been telling people to put their WATTx address in.
+//
+// Returns false when neither yields a usable address.
+//
+// This used to end with `if (wtx_address.empty()) wtx_address =
+// m_config.wattx_wallet_address;` -- the POOL's own wallet. A miner who
+// followed the published instructions supplied no '+', so every block they
+// found paid the pool and they saw nothing, with no error and no log. Silently
+// redirecting someone's block reward to ourselves is the worst possible
+// default, so this now fails closed and the caller tells them why.
+//
+// An unparseable address is rejected here too: accepting it would only move the
+// silent failure downstream, where the payout builder drops the recipient.
+static bool ResolveMinerPayout(const std::string& login, const std::string& password,
+                               std::string& parent_address, std::string& wtx_address,
+                               std::string& worker)
+{
+    parent_address.clear();
+    wtx_address.clear();
+    worker.clear();
 
-    std::string parent_address, wtx_address, worker;
-    size_t plus_pos = login.find('+');
-    size_t dot_pos  = login.find('.');
+    const size_t plus_pos = login.find('+');
+    const size_t dot_pos  = login.find('.');
     if (plus_pos != std::string::npos) {
         parent_address = login.substr(0, plus_pos);
         if (dot_pos != std::string::npos && dot_pos > plus_pos) {
@@ -863,7 +882,48 @@ void MultiMergedStratumServer::HandleAuthorize(int client_id, const std::string&
     } else {
         parent_address = login;
     }
-    if (wtx_address.empty()) wtx_address = m_config.wattx_wallet_address;
+
+    // No '+' given. Miners overwhelmingly expect "username = my wallet address",
+    // which is the convention on essentially every other pool, so if the login
+    // itself is a valid WATTx address take it as the payout target. This is what
+    // the miner who lost 56 blocks actually typed: `-u WTv6Vd6...`, no '+'. The
+    // parent-chain address is then simply not supplied, which costs them the
+    // parent coin but must never cost them WATTx.
+    if (wtx_address.empty() && IsValidDestination(DecodeDestination(parent_address))) {
+        wtx_address = parent_address;
+        parent_address.clear();
+    }
+
+    // Otherwise fall back to the password, as the published instructions said.
+    if (wtx_address.empty()) wtx_address = password;
+
+    // Miners commonly pass "x" or "d=..." as a placeholder password; those are
+    // not addresses and must not be treated as one.
+    if (wtx_address.empty()) return false;
+    return IsValidDestination(DecodeDestination(wtx_address));
+}
+
+//! The error a miner sees when we cannot tell where to pay them.
+static const char* kNoPayoutAddressMsg =
+    "No valid WATTx payout address. Use -u <PARENT_ADDRESS>+<YOUR_WTX_ADDRESS>.<worker> "
+    "(or put your WATTx address in the password field). "
+    "Mining was refused rather than paying the pool.";
+
+
+// ── Bitcoin stratum: mining.authorize ─────────────────────────────────────────
+// Login format same as XMRig: "PARENT_ADDR+WTX_ADDR.worker" or "PARENT_ADDR.worker"
+void MultiMergedStratumServer::HandleAuthorize(int client_id, const std::string& id,
+                                                const std::vector<std::string>& params) {
+    std::string login = params.size() >= 1 ? params[0] : "";
+
+    std::string parent_address, wtx_address, worker;
+    const std::string password = params.size() >= 2 ? params[1] : "";
+    if (!ResolveMinerPayout(login, password, parent_address, wtx_address, worker)) {
+        LogPrintf("MultiMergedStratum: refusing client %d -- %s (login=\"%s\")\n",
+                  client_id, kNoPayoutAddressMsg, login);
+        SendError(client_id, id, 24, kNoPayoutAddressMsg);
+        return;
+    }
 
     ParentChainAlgo algo;
     MultiAlgoJob job;
@@ -1056,23 +1116,13 @@ void MultiMergedStratumServer::HandleZcashAuthorize(int client_id, const std::st
     // Login string identical to the other protocols: PARENT+WTX.worker
     std::string login = params.size() >= 1 ? params[0] : "";
     std::string parent_address, wtx_address, worker;
-    size_t plus_pos = login.find('+');
-    size_t dot_pos  = login.find('.');
-    if (plus_pos != std::string::npos) {
-        parent_address = login.substr(0, plus_pos);
-        if (dot_pos != std::string::npos && dot_pos > plus_pos) {
-            wtx_address = login.substr(plus_pos + 1, dot_pos - plus_pos - 1);
-            worker      = login.substr(dot_pos + 1);
-        } else {
-            wtx_address = login.substr(plus_pos + 1);
-        }
-    } else if (dot_pos != std::string::npos) {
-        parent_address = login.substr(0, dot_pos);
-        worker         = login.substr(dot_pos + 1);
-    } else {
-        parent_address = login;
+    const std::string password = params.size() >= 2 ? params[1] : "";
+    if (!ResolveMinerPayout(login, password, parent_address, wtx_address, worker)) {
+        LogPrintf("MultiMergedStratum: refusing client %d -- %s (login=\"%s\")\n",
+                  client_id, kNoPayoutAddressMsg, login);
+        SendError(client_id, id, 24, kNoPayoutAddressMsg);
+        return;
     }
-    if (wtx_address.empty()) wtx_address = m_config.wattx_wallet_address;
 
     ParentChainAlgo algo;
     std::string chain_name;
@@ -1227,26 +1277,14 @@ void MultiMergedStratumServer::HandleZcashSubmit(int client_id, const std::strin
 void MultiMergedStratumServer::HandleEthSubmitLogin(int client_id, const std::string& id,
                                                      const std::vector<std::string>& params) {
     std::string login = params.size() >= 1 ? params[0] : "";
-    std::string wtx_address;
-    std::string worker;
-    size_t plus_pos = login.find('+');
-    size_t dot_pos  = login.find('.');
-    std::string parent_address;
-    if (plus_pos != std::string::npos) {
-        parent_address = login.substr(0, plus_pos);
-        if (dot_pos != std::string::npos && dot_pos > plus_pos) {
-            wtx_address = login.substr(plus_pos + 1, dot_pos - plus_pos - 1);
-            worker      = login.substr(dot_pos + 1);
-        } else {
-            wtx_address = login.substr(plus_pos + 1);
-        }
-    } else if (dot_pos != std::string::npos) {
-        parent_address = login.substr(0, dot_pos);
-        worker         = login.substr(dot_pos + 1);
-    } else {
-        parent_address = login;
+    const std::string password = params.size() >= 2 ? params[1] : "";
+    std::string parent_address, wtx_address, worker;
+    if (!ResolveMinerPayout(login, password, parent_address, wtx_address, worker)) {
+        LogPrintf("MultiMergedStratum: refusing client %d -- %s (login=\"%s\")\n",
+                  client_id, kNoPayoutAddressMsg, login);
+        SendError(client_id, id, 24, kNoPayoutAddressMsg);
+        return;
     }
-    if (wtx_address.empty()) wtx_address = m_config.wattx_wallet_address;
 
     ParentChainAlgo algo;
     MultiAlgoJob job;
@@ -1354,29 +1392,14 @@ void MultiMergedStratumServer::HandleLogin(int client_id, const std::string& id,
     if (params.size() >= 2) pass = params[1];
     if (params.size() >= 3) agent = params[2];
 
-    // Parse addresses: "PARENT_ADDR+WTX_ADDR.WORKER" or "PARENT_ADDR.WORKER"
+    // Where the miner's WATTx rewards go: "PARENT_ADDR+WTX_ADDR.WORKER", or the
+    // password field, which is what the published instructions used.
     std::string parent_address, wtx_address, worker;
-
-    size_t plus_pos = login.find('+');
-    size_t dot_pos = login.find('.');
-
-    if (plus_pos != std::string::npos) {
-        parent_address = login.substr(0, plus_pos);
-        if (dot_pos != std::string::npos && dot_pos > plus_pos) {
-            wtx_address = login.substr(plus_pos + 1, dot_pos - plus_pos - 1);
-            worker = login.substr(dot_pos + 1);
-        } else {
-            wtx_address = login.substr(plus_pos + 1);
-        }
-    } else if (dot_pos != std::string::npos) {
-        parent_address = login.substr(0, dot_pos);
-        worker = login.substr(dot_pos + 1);
-    } else {
-        parent_address = login;
-    }
-
-    if (wtx_address.empty()) {
-        wtx_address = m_config.wattx_wallet_address;
+    if (!ResolveMinerPayout(login, pass, parent_address, wtx_address, worker)) {
+        LogPrintf("MultiMergedStratum: refusing client %d -- %s (login=\"%s\")\n",
+                  client_id, kNoPayoutAddressMsg, login);
+        SendError(client_id, id, 24, kNoPayoutAddressMsg);
+        return;
     }
 
     ParentChainAlgo algo;
