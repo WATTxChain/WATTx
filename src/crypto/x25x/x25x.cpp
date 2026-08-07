@@ -177,6 +177,30 @@ bool IsAlgorithmEnabled(Algorithm algo)
     return GetAlgorithmInfo(algo).enabled;
 }
 
+bool HasSoloProofOfWork(Algorithm algo)
+{
+    switch (algo) {
+        case Algorithm::SHA256D:
+        case Algorithm::SCRYPT:
+        case Algorithm::ETHASH:
+        case Algorithm::RANDOMX:
+        case Algorithm::X11:
+        case Algorithm::KHEAVYHASH:
+            return true;
+
+        // Equihash's proof is a Wagner solution and the header has nowhere to
+        // put one; GhostRider has no implementation at all. Neither can be
+        // proved by hashing a header, so neither may be solo-mined. Merged
+        // mining is unaffected: AuxPoW blocks are verified by CheckAuxProofOfWork
+        // against the parent block, which does carry the solution.
+        case Algorithm::EQUIHASH:
+        case Algorithm::GHOSTRIDER:
+        case Algorithm::INVALID:
+            return false;
+    }
+    return false;
+}
+
 Algorithm GetBlockAlgorithm(int32_t nVersion)
 {
     // Algorithm is encoded in bits 8-15 of nVersion
@@ -520,12 +544,26 @@ uint256 HashBlockHeader(const CBlockHeader& header, Algorithm algo, uint64_t blo
             return hash::KHeavyHash(header);
 
         case Algorithm::EQUIHASH:
-            // Equihash doesn't return a hash; verification is different
-            // Fall through to SHA256D for hash-based comparisons
         case Algorithm::GHOSTRIDER:
-            // Not implemented yet
+        case Algorithm::INVALID:
         default:
-            return hash::SHA256D(header);
+            // FAIL CLOSED -- an all-ones hash, which cannot be below any valid
+            // target, so an algorithm with no header-provable work is simply
+            // unmineable.
+            //
+            // These used to fall through to hash::SHA256D. Equihash is ENABLED,
+            // so a block could declare algo EQUIHASH in nVersion and be accepted
+            // on a plain double-SHA256 hash -- while paying the EQUIHASH
+            // difficulty, which is a different retarget chain entirely. An ASIC
+            // could mine against whichever of the two targets was easier, and on
+            // a chain where sha256d difficulty is set by Bitcoin merged mining
+            // and equihash difficulty by a far smaller parent, that is orders of
+            // magnitude cheaper than mining honestly. Cheap blocks are what
+            // makes a reorg -- and a double spend -- affordable.
+            //
+            // The `default:` fallback was the same trap for any algorithm added
+            // to g_algorithm_info without a case here.
+            return ArithToUint256(~arith_uint256());
     }
 }
 
@@ -539,14 +577,18 @@ bool CheckProofOfWork(const CBlockHeader& header, unsigned int nBits, const Cons
         return false;
     }
 
+    // An enabled algorithm is not necessarily one that can be proved from a bare
+    // header. Refuse those outright instead of hashing them with something else:
+    // the previous behaviour verified an EQUIHASH-declaring block with SHA256D.
+    if (!HasSoloProofOfWork(algo)) {
+        LogPrintf("X25X: %s cannot be solo-mined -- its proof of work is not "
+                  "verifiable from a block header (merged mining only)\n",
+                  GetAlgorithmInfo(algo).name);
+        return false;
+    }
+
     // Get the hash for this algorithm
     uint256 hash = HashBlockHeader(header, algo);
-
-    // Special case for Equihash - uses solution verification
-    if (algo == Algorithm::EQUIHASH) {
-        // Equihash verification would go here
-        // For now, fall back to hash comparison
-    }
 
     // Standard hash comparison against target
     bool fNegative;

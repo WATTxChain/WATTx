@@ -87,6 +87,20 @@ std::vector<Algorithm> GetEnabledAlgorithms();
 bool IsAlgorithmEnabled(Algorithm algo);
 
 /**
+ * @brief Can this algorithm's proof of work be verified from the block header alone?
+ *
+ * An algorithm may be ENABLED (it takes part in merged mining, has a difficulty
+ * chain, is offered by the stratum server) and still have no way to prove work
+ * from a bare CBlockHeader. Equihash is the case that matters: its proof is a
+ * Wagner solution, which the header has nowhere to carry, so it can only be
+ * proved through the AuxPoW path where the parent block supplies it.
+ *
+ * Solo mining such an algorithm MUST be refused rather than approximated with
+ * some other algorithm's hash -- see HashBlockHeader.
+ */
+bool HasSoloProofOfWork(Algorithm algo);
+
+/**
  * Extract algorithm from block version
  * Algorithm is encoded in bits 8-15 of nVersion
  */

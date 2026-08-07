@@ -235,6 +235,18 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
 
 static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const CScript& coinbase_output_script, int nGenerate, uint64_t nMaxTries, std::optional<x25x::Algorithm> algo = std::nullopt)
 {
+    // Refuse an algorithm that cannot be proved from a block header, rather than
+    // grinding to nMaxTries and returning an empty list. Equihash is the case:
+    // its proof is a Wagner solution the header cannot carry, so it is merged-
+    // mining only. Consensus rejects such blocks (x25x::CheckProofOfWork), and
+    // saying so here is more use than silence.
+    if (algo.has_value() && !x25x::HasSoloProofOfWork(algo.value())) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            strprintf("%s cannot be solo-mined: its proof of work is not verifiable "
+                      "from a block header. It is available through merged mining only.",
+                      x25x::GetAlgorithmInfo(algo.value()).name));
+    }
+
     UniValue blockHashes(UniValue::VARR);
     while (nGenerate > 0 && !chainman.m_interrupt) {
         int32_t nTimeLimit = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()) + node::POW_MINER_MAX_TIME;
