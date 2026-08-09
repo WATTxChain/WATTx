@@ -53,6 +53,11 @@ public:
     /** Callback for found blocks */
     using BlockFoundCallback = std::function<void(const CBlock&)>;
 
+    /** Callback for pool shares found by StartBlobMining. Receives the nonce
+     *  that was spliced into the blob and the resulting RandomX hash. Mining
+     *  CONTINUES after the callback — a pool wants every share, not the first. */
+    using ShareFoundCallback = std::function<void(uint32_t nonce, const uint256& hash)>;
+
     RandomXMiner();
     ~RandomXMiner();
 
@@ -101,6 +106,18 @@ public:
      */
     void StartMining(const CBlock& block, const uint256& target,
                      int numThreads, BlockFoundCallback callback);
+
+    /**
+     * Mine an arbitrary hashing blob (pool mining): splice a nonce into the
+     * blob at nonceOffset (4 bytes, little-endian), RandomX-hash the blob, and
+     * report every hash meeting the target via the callback. Unlike
+     * StartMining this never stops on a find — the pool wants a stream of
+     * shares. The context must already be Initialize()d with the pool job's
+     * seed. Runs until StopMining() or a new StartBlobMining() call.
+     * @return false when the blob/offset is invalid or no VMs are available
+     */
+    bool StartBlobMining(const std::vector<unsigned char>& blob, size_t nonceOffset,
+                         const uint256& target, int numThreads, ShareFoundCallback callback);
 
     /**
      * Stop all mining threads
@@ -171,6 +188,14 @@ private:
     void MineThread(int threadId, CBlock block, uint256 target,
                     uint32_t startNonce, uint32_t nonceRange,
                     BlockFoundCallback callback);
+
+    /** Pool-blob mining thread function */
+    void BlobMineThread(int threadId, std::vector<unsigned char> blob, size_t nonceOffset,
+                        uint256 target, uint32_t startNonce, uint32_t nonceRange,
+                        ShareFoundCallback callback);
+
+    /** Create per-thread VMs (under m_vmMutex); returns the usable thread count. */
+    int PrepareVMs(int numThreads);
 
     /** Set low priority for mining threads */
     static void SetLowThreadPriority();

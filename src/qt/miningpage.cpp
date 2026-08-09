@@ -4,6 +4,7 @@
 
 #include <qt/miningpage.h>
 #include <qt/clientmodel.h>
+#include <qt/stratumpoolclient.h>
 #include <qt/walletmodel.h>
 #include <qt/platformstyle.h>
 #include <qt/guiutil.h>
@@ -40,6 +41,7 @@
 #include <QProgressBar>
 #include <QButtonGroup>
 #include <QMessageBox>
+#include <QRegularExpression>
 #include <QThread>
 #include <QApplication>
 #include <QTextEdit>
@@ -92,18 +94,11 @@ void MiningPage::setupUi()
     modeLayout->setContentsMargins(4, 2, 4, 2);
 
     soloMiningRadio = new QRadioButton(tr("Solo"), this);
-    poolMiningRadio = new QRadioButton(tr("Pool (not available)"), this);
+    poolMiningRadio = new QRadioButton(tr("Pool"), this);
     soloMiningRadio->setChecked(true);
 
-    // Pool mining is not implemented. The pool URL and worker fields are only
-    // validated for non-emptiness and are never connected to -- there is no
-    // stratum client in the GUI at all -- so selecting "Pool" silently mined
-    // solo against the local node. A user who entered a pool address and then
-    // saw no shares had no way to tell that nothing was listening. Disable the
-    // option rather than let the UI imply a feature that does not exist.
-    poolMiningRadio->setEnabled(false);
-    poolMiningRadio->setToolTip(tr("Pool mining is not implemented in the wallet yet. "
-                                   "Use an external miner such as XMRig to mine to a pool."));
+    poolMiningRadio->setToolTip(tr("Mine RandomX shares to a stratum pool (XMRig protocol). "
+                                   "Rewards are paid by the pool to your selected mining address."));
 
     QButtonGroup *modeButtonGroup = new QButtonGroup(this);
     modeButtonGroup->addButton(soloMiningRadio);
@@ -322,11 +317,13 @@ void MiningPage::createPoolControls(QGroupBox *group)
     layout->addWidget(new QLabel(tr("Pool URL:"), this), 0, 0);
     poolUrlEdit = new QLineEdit(this);
     poolUrlEdit->setPlaceholderText(tr("stratum+tcp://pool.example.com:3333"));
+    // The public WATTx pool's RandomX port, so pool mining works out of the box.
+    poolUrlEdit->setText(QStringLiteral("stratum+tcp://pools.wattxchange.app:3433"));
     layout->addWidget(poolUrlEdit, 0, 1);
 
     layout->addWidget(new QLabel(tr("Worker Name:"), this), 1, 0);
     poolWorkerEdit = new QLineEdit(this);
-    poolWorkerEdit->setPlaceholderText(tr("wallet_address.worker_name"));
+    poolWorkerEdit->setPlaceholderText(tr("optional, e.g. rig1"));
     layout->addWidget(poolWorkerEdit, 1, 1);
 
     layout->addWidget(new QLabel(tr("Password:"), this), 2, 0);
@@ -428,12 +425,19 @@ void MiningPage::onPoolUrlChanged()
 bool MiningPage::validatePoolSettings()
 {
     if (poolMiningRadio->isChecked()) {
-        if (poolUrlEdit->text().isEmpty()) {
+        const QString url = poolUrlEdit->text().trimmed();
+        if (url.isEmpty()) {
             QMessageBox::warning(this, tr("Mining"), tr("Please enter a pool URL."));
             return false;
         }
-        if (poolWorkerEdit->text().isEmpty()) {
-            QMessageBox::warning(this, tr("Mining"), tr("Please enter a worker name."));
+        QString hostport = url;
+        hostport.remove(QRegularExpression("^stratum\\+(tcp|ssl)://"));
+        const int colon = hostport.lastIndexOf(':');
+        bool port_ok = false;
+        if (colon > 0) hostport.mid(colon + 1).toUShort(&port_ok);
+        if (colon <= 0 || !port_ok) {
+            QMessageBox::warning(this, tr("Mining"),
+                tr("Pool URL must look like stratum+tcp://host:port."));
             return false;
         }
     }
@@ -508,6 +512,11 @@ void MiningPage::startMining()
     QString address = miningAddressCombo->currentData().toString();
     if (address.isEmpty() || address == "new") {
         QMessageBox::warning(this, tr("Mining"), tr("Please select a valid mining address."));
+        return;
+    }
+
+    if (poolMiningRadio->isChecked()) {
+        startPoolMining(address);
         return;
     }
 
@@ -938,6 +947,177 @@ void MiningPage::startMiningActual()
     statsTimer->start(1000);  // Update every 1 second
 }
 
+void MiningPage::startPoolMining(const QString& address)
+{
+    // validatePoolSettings() has already vetted the URL shape.
+    QString hostport = poolUrlEdit->text().trimmed();
+    hostport.remove(QRegularExpression("^stratum\\+(tcp|ssl)://"));
+    const int colon = hostport.lastIndexOf(':');
+    const QString host = hostport.left(colon);
+    const quint16 port = hostport.mid(colon + 1).toUShort();
+
+    miningConsole->clear();
+    logToConsole(tr("=== WATTx Pool Mining (RandomX) ==="));
+    logToConsole(tr("Pool: %1:%2").arg(host).arg(port));
+    logToConsole(tr("Payout Address: %1").arg(address));
+
+    currentCpuThreads = cpuThreadsSpinBox->value();
+    logToConsole(tr("Mode: %1, Threads: %2, Safe Mode: %3")
+        .arg(rxModeCombo && rxModeCombo->currentIndex() == 1 ? "Full (2GB)" : "Light (256MB)")
+        .arg(currentCpuThreads.load())
+        .arg(safeModeCheckbox && safeModeCheckbox->isChecked() ? "ON" : "OFF"));
+    logToConsole(tr(""));
+
+    if (!poolClient) {
+        poolClient = new StratumPoolClient(this);
+        connect(poolClient, &StratumPoolClient::logMessage, this, &MiningPage::logToConsole);
+        connect(poolClient, &StratumPoolClient::newJob, this, &MiningPage::handlePoolJob);
+        connect(poolClient, &StratumPoolClient::loggedIn, this, [this] {
+            statusLabel->setText(tr("Mining Active - Pool (RandomX)"));
+            statusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+        });
+        connect(poolClient, &StratumPoolClient::shareResult, this,
+                [this](bool accepted, const QString& error) {
+            if (accepted) {
+                logToConsole(tr("Share accepted (%1 total)").arg(poolClient->sharesAccepted()));
+            } else {
+                logToConsole(tr("Share REJECTED: %1 (%2 total)")
+                                 .arg(error).arg(poolClient->sharesRejected()));
+            }
+        });
+        connect(poolClient, &StratumPoolClient::disconnected, this,
+                [this](const QString& reason) {
+            if (!isMining || !poolMode) return;
+            if (!poolClient->isActive()) {
+                // Login refused: hashing against a pool that will not pay is
+                // exactly the silent failure the old fake Pool mode had.
+                logToConsole(tr("Pool mining stopped: %1").arg(reason));
+                stopMining();
+            } else {
+                statusLabel->setText(tr("Pool connection lost - reconnecting…"));
+                statusLabel->setStyleSheet("color: #FFA500; font-weight: bold;");
+            }
+        });
+    }
+
+    isMining = true;
+    poolMode = true;
+    miningStartTime = QDateTime::currentSecsSinceEpoch();
+    sessionBlocksFound = 0;
+    updateMiningButton(true);
+    statusLabel->setText(tr("Connecting to pool…"));
+    statusLabel->setStyleSheet("color: #FFA500; font-weight: bold;");
+
+    // "ADDRESS.worker" — the pool reads the payout address from the login and
+    // the worker tag after the dot.
+    QString login = address;
+    const QString worker = poolWorkerEdit->text().trimmed();
+    if (!worker.isEmpty()) login += QLatin1Char('.') + worker;
+    poolClient->start(host, port, login, poolPasswordEdit->text());
+
+    statsTimer->start(1000);
+}
+
+void MiningPage::handlePoolJob(const QString& blob_hex, const QString& job_id,
+                               const QString& target_hex, const QString& seed_hash, qint64 height)
+{
+    if (!isMining || !poolMode) return;
+
+    logToConsole(tr("New pool job %1 (parent height %2)").arg(job_id).arg(height));
+
+    const uint64_t gen = ++poolJobGeneration;
+    const bool fullMode = rxModeCombo && rxModeCombo->currentIndex() == 1;
+    const bool safeMode = safeModeCheckbox && safeModeCheckbox->isChecked();
+    const int numThreads = currentCpuThreads.load();
+    const std::string blob_str = blob_hex.toStdString();
+    const std::string target_str = target_hex.toStdString();
+    const std::string seed_str = seed_hash.toStdString();
+
+    // RandomX cache init takes seconds (minutes in FULL mode) — never block the
+    // GUI thread. A job thread abandons its work when a newer job supersedes it.
+    std::thread jobThread([this, gen, blob_str, target_str, seed_str, job_id,
+                           fullMode, safeMode, numThreads]() {
+        const auto guiLog = [this](const QString& msg) {
+            QMetaObject::invokeMethod(this, [this, msg] { logToConsole(msg); },
+                                      Qt::QueuedConnection);
+        };
+
+        std::vector<unsigned char> blob = ParseHex(blob_str);
+
+        // Monero-style hashing blob: varint(major) varint(minor)
+        // varint(timestamp), 32-byte previous id, then the 4-byte nonce. This
+        // is the same walk the pool server does to splice the nonce back in
+        // when it verifies the share — the two must agree byte for byte.
+        size_t pos = 0;
+        for (int i = 0; i < 3 && pos < blob.size(); i++) {
+            while (pos < blob.size()) { uint8_t b = blob[pos++]; if (!(b & 0x80)) break; }
+        }
+        pos += 32;
+        if (pos + 4 > blob.size()) {
+            guiLog(tr("Pool job blob too short - skipping"));
+            return;
+        }
+        const size_t nonce_offset = pos;
+
+        // Compact stratum target: 16 hex chars are the little-endian u64
+        // occupying the top 8 bytes of the 256-bit target (8 chars: top 4).
+        const std::vector<unsigned char> target_bytes = ParseHex(target_str);
+        uint256 target;
+        if (target_bytes.size() == 8) {
+            std::memcpy(target.data() + 24, target_bytes.data(), 8);
+        } else if (target_bytes.size() == 4) {
+            std::memcpy(target.data() + 28, target_bytes.data(), 4);
+        } else {
+            guiLog(tr("Pool sent an unsupported target format - skipping job"));
+            return;
+        }
+
+        auto& aux = node::GetRandomXAuxMiner();
+        {
+            std::lock_guard<std::mutex> lock(poolSeedMutex);
+            if (seed_str != poolSeedHash || !aux.IsInitialized()) {
+                const std::vector<unsigned char> seed = ParseHex(seed_str);
+                if (seed.size() != 32) {
+                    guiLog(tr("Pool job carries no usable RandomX seed - skipping"));
+                    return;
+                }
+                guiLog(tr("Initializing RandomX with the pool's seed…"));
+                aux.StopMining();
+                if (!aux.Initialize(seed.data(), seed.size(),
+                                    fullMode ? node::RandomXMiner::Mode::FULL
+                                             : node::RandomXMiner::Mode::LIGHT,
+                                    safeMode)) {
+                    guiLog(tr("RandomX initialization failed - pool mining cannot start"));
+                    return;
+                }
+                poolSeedHash = seed_str;
+            }
+        }
+
+        if (gen != poolJobGeneration.load()) return;  // a newer job arrived
+
+        aux.StartBlobMining(blob, nonce_offset, target, numThreads,
+            [this, job_id](uint32_t nonce, const uint256& hash) {
+                const unsigned char nb[4] = {
+                    static_cast<unsigned char>(nonce & 0xff),
+                    static_cast<unsigned char>((nonce >> 8) & 0xff),
+                    static_cast<unsigned char>((nonce >> 16) & 0xff),
+                    static_cast<unsigned char>((nonce >> 24) & 0xff),
+                };
+                const QString nonceHex = QString::fromStdString(
+                    HexStr(std::span<const unsigned char>(nb, 4)));
+                const QString resultHex = QString::fromStdString(
+                    HexStr(std::span<const unsigned char>(hash.begin(), 32)));
+                QMetaObject::invokeMethod(this, [this, job_id, nonceHex, resultHex] {
+                    if (isMining && poolMode && poolClient) {
+                        poolClient->submitShare(job_id, nonceHex, resultHex);
+                    }
+                }, Qt::QueuedConnection);
+            });
+    });
+    jobThread.detach();
+}
+
 void MiningPage::stopMining()
 {
     if (!isMining) return;
@@ -951,9 +1131,20 @@ void MiningPage::stopMining()
     statusLabel->setStyleSheet("color: #FFA500; font-weight: bold;");
     statsTimer->stop();
 
+    const bool pool = poolMode.load();
+    if (pool) {
+        poolMode = false;
+        ++poolJobGeneration;                  // in-flight job threads abandon their work
+        if (poolClient) poolClient->stop();   // socket lives on the GUI thread
+    }
+
     // Stop mining in background thread
-    std::thread stopThread([this]() {
-        node::GetRandomXMiner().StopMining();
+    std::thread stopThread([this, pool]() {
+        if (pool) {
+            node::GetRandomXAuxMiner().StopMining();
+        } else {
+            node::GetRandomXMiner().StopMining();
+        }
 
         QMetaObject::invokeMethod(this, [this]() {
             logToConsole(tr("=== Mining Stopped ==="));
@@ -1015,8 +1206,11 @@ void MiningPage::updateMiningStats()
 {
     if (!isMining) return;
 
-    // Update hashrate and stats from miner
-    node::RandomXMiner& miner = node::GetRandomXMiner();
+    // Update hashrate and stats from whichever miner this session runs on:
+    // pool mode hashes on the aux context (keyed with the pool's seed), solo
+    // on the main one (keyed for WATTx consensus).
+    node::RandomXMiner& miner = poolMode ? node::GetRandomXAuxMiner()
+                                         : node::GetRandomXMiner();
     double hashrate = miner.GetHashrate();
     uint64_t totalHashes = miner.GetTotalHashes();
 
@@ -1034,8 +1228,12 @@ void MiningPage::updateMiningStats()
             .arg(seconds, 2, 10, QChar('0')));
     }
 
-    // Update accepted (blocks found this session)
-    gapsCheckedLabel->setText(QString::number(sessionBlocksFound));
+    // Update accepted: pool shares in pool mode, blocks found when solo
+    if (poolMode && poolClient) {
+        gapsCheckedLabel->setText(QString::number(poolClient->sharesAccepted()));
+    } else {
+        gapsCheckedLabel->setText(QString::number(sessionBlocksFound));
+    }
 
     // Update network difficulty
     if (clientModel) {

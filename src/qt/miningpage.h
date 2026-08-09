@@ -11,12 +11,15 @@
 #include <QTimer>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <string>
 
 QT_BEGIN_NAMESPACE
 class QTextEdit;
 QT_END_NAMESPACE
 
 class ClientModel;
+class StratumPoolClient;
 class WalletModel;
 class PlatformStyle;
 
@@ -68,6 +71,9 @@ private:
     void updateAddressCombo();
     void startMining();
     void startMiningActual();  // Called after GPU initialization (async)
+    void startPoolMining(const QString& address);
+    void handlePoolJob(const QString& blob_hex, const QString& job_id,
+                       const QString& target_hex, const QString& seed_hash, qint64 height);
     void stopMining();
     bool validatePoolSettings();
 
@@ -131,6 +137,17 @@ private:
     // Mining state
     std::atomic<bool> isMining{false};
     std::atomic<int> currentCpuThreads{1};
+
+    // Pool mining state. The stratum client lives on the GUI thread; pool jobs
+    // are prepared (seed init + blob mining start) on detached worker threads,
+    // serialized loosely by poolJobGeneration — a job thread abandons its work
+    // when a newer job has arrived. poolSeedMutex guards poolSeedHash, which
+    // tracks the seed the AUX RandomX context is currently keyed with.
+    StratumPoolClient *poolClient{nullptr};
+    std::atomic<bool> poolMode{false};
+    std::atomic<uint64_t> poolJobGeneration{0};
+    std::mutex poolSeedMutex;
+    std::string poolSeedHash;
     int currentGpuBandwidth;
     int64_t miningStartTime{0};  // For uptime tracking
     int sessionBlocksFound{0};   // Blocks found this session

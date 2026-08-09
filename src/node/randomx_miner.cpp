@@ -389,49 +389,7 @@ void RandomXMiner::StartMining(const CBlock& block, const uint256& target,
     LogPrintf("RandomX: DEBUG - about to lock vmMutex, m_cache=%p, m_dataset=%p\n",
               (void*)m_cache, (void*)m_dataset);
 
-    // Create VMs for each thread
-    {
-        std::lock_guard<std::mutex> lock(m_vmMutex);
-
-        LogPrintf("RandomX: DEBUG - locked vmMutex, checking cache\n");
-
-        // Safety check: m_cache must be valid
-        if (!m_cache) {
-            LogPrintf("RandomX: Cannot create VMs - cache is null\n");
-            m_mining = false;
-            return;
-        }
-
-        LogPrintf("RandomX: DEBUG - creating VMs, current count=%zu, need=%d\n",
-                  m_vms.size(), numThreads);
-
-        // randomx_create_vm asserts if FULL_MEM is set without a dataset, which
-        // aborts the whole process. Fall back to light mode instead: slower
-        // verification is always better than killing the wallet.
-        unsigned vm_flags = m_flags;
-        if (!m_dataset && (vm_flags & RANDOMX_FLAG_FULL_MEM)) {
-            LogPrintf("RandomX: no dataset allocated, creating VMs in light mode\n");
-            vm_flags &= ~static_cast<unsigned>(RANDOMX_FLAG_FULL_MEM);
-            m_flags = vm_flags;
-            m_mode = Mode::LIGHT;
-        }
-
-        while (m_vms.size() < static_cast<size_t>(numThreads)) {
-            LogPrintf("RandomX: DEBUG - calling randomx_create_vm (flags=0x%x)\n", vm_flags);
-            randomx_vm* vm = randomx_create_vm(
-                static_cast<randomx_flags>(vm_flags),
-                m_cache,
-                m_dataset
-            );
-            if (!vm) {
-                LogPrintf("RandomX: Failed to create VM for thread %zu\n", m_vms.size());
-                break;
-            }
-            LogPrintf("RandomX: DEBUG - VM created: %p\n", (void*)vm);
-            m_vms.push_back(vm);
-        }
-        numThreads = std::min(numThreads, static_cast<int>(m_vms.size()));
-    }
+    numThreads = PrepareVMs(numThreads);
 
     if (numThreads == 0) {
         LogPrintf("RandomX: No VMs available, cannot mine\n");
@@ -447,6 +405,158 @@ void RandomXMiner::StartMining(const CBlock& block, const uint256& target,
         m_threads.emplace_back(&RandomXMiner::MineThread, this,
                                i, block, target, startNonce, nonceRange, callback);
     }
+}
+
+int RandomXMiner::PrepareVMs(int numThreads) {
+    std::lock_guard<std::mutex> lock(m_vmMutex);
+
+    // Safety check: m_cache must be valid
+    if (!m_cache) {
+        LogPrintf("RandomX: Cannot create VMs - cache is null\n");
+        return 0;
+    }
+
+    // randomx_create_vm asserts if FULL_MEM is set without a dataset, which
+    // aborts the whole process. Fall back to light mode instead: slower
+    // verification is always better than killing the wallet.
+    unsigned vm_flags = m_flags;
+    if (!m_dataset && (vm_flags & RANDOMX_FLAG_FULL_MEM)) {
+        LogPrintf("RandomX: no dataset allocated, creating VMs in light mode\n");
+        vm_flags &= ~static_cast<unsigned>(RANDOMX_FLAG_FULL_MEM);
+        m_flags = vm_flags;
+        m_mode = Mode::LIGHT;
+    }
+
+    while (m_vms.size() < static_cast<size_t>(numThreads)) {
+        randomx_vm* vm = randomx_create_vm(
+            static_cast<randomx_flags>(vm_flags),
+            m_cache,
+            m_dataset
+        );
+        if (!vm) {
+            LogPrintf("RandomX: Failed to create VM for thread %zu\n", m_vms.size());
+            break;
+        }
+        m_vms.push_back(vm);
+    }
+    return std::min(numThreads, static_cast<int>(m_vms.size()));
+}
+
+bool RandomXMiner::StartBlobMining(const std::vector<unsigned char>& blob, size_t nonceOffset,
+                                   const uint256& target, int numThreads,
+                                   ShareFoundCallback callback) {
+    // Stop any existing mining
+    StopMining();
+
+    if (!m_initialized) {
+        LogPrintf("RandomX: Cannot start blob mining - not initialized\n");
+        return false;
+    }
+    if (blob.empty() || nonceOffset + 4 > blob.size()) {
+        LogPrintf("RandomX: Cannot start blob mining - bad blob (%zu bytes, nonce at %zu)\n",
+                  blob.size(), nonceOffset);
+        return false;
+    }
+
+    if (numThreads <= 0) {
+        numThreads = std::min(2, std::max(1, static_cast<int>(std::thread::hardware_concurrency()) - 1));
+    }
+
+    m_stopMining = false;
+    m_mining = true;
+    m_totalHashes = 0;
+    m_miningStartTime = GetTime();
+
+    // Initialize session tracking on first job (don't reset between jobs)
+    if (m_sessionStartTime == 0) {
+        m_sessionStartTime = GetTime();
+        m_sessionHashes = 0;
+        m_recentWindowStart = GetTime();
+        m_recentHashes = 0;
+    }
+
+    numThreads = PrepareVMs(numThreads);
+    if (numThreads == 0) {
+        LogPrintf("RandomX: No VMs available, cannot mine\n");
+        m_mining = false;
+        return false;
+    }
+
+    LogPrintf("RandomX: Starting pool blob mining with %d threads (blob %zu bytes, nonce at %zu)\n",
+              numThreads, blob.size(), nonceOffset);
+
+    // Split nonce range among threads
+    uint32_t nonceRange = UINT32_MAX / numThreads;
+
+    for (int i = 0; i < numThreads; i++) {
+        uint32_t startNonce = i * nonceRange;
+        m_threads.emplace_back(&RandomXMiner::BlobMineThread, this,
+                               i, blob, nonceOffset, target, startNonce, nonceRange, callback);
+    }
+    return true;
+}
+
+void RandomXMiner::BlobMineThread(int threadId, std::vector<unsigned char> blob, size_t nonceOffset,
+                                  uint256 target, uint32_t startNonce, uint32_t nonceRange,
+                                  ShareFoundCallback callback) {
+    SetLowThreadPriority();
+
+    randomx_vm* vm = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_vmMutex);
+        if (static_cast<size_t>(threadId) < m_vms.size()) {
+            vm = m_vms[threadId];
+        }
+    }
+    if (!vm) {
+        LogPrintf("RandomX: Blob thread %d has no VM\n", threadId);
+        return;
+    }
+
+    uint32_t nonce = startNonce;
+    uint64_t hashCount = 0;
+    unsigned char hashOutput[HASH_SIZE];
+
+    while (!m_stopMining && nonce < startNonce + nonceRange) {
+        // Splice the nonce into the blob, little-endian — the same 4 bytes are
+        // submitted to the pool as hex, so blob bytes and submit bytes agree.
+        blob[nonceOffset + 0] = static_cast<unsigned char>(nonce & 0xff);
+        blob[nonceOffset + 1] = static_cast<unsigned char>((nonce >> 8) & 0xff);
+        blob[nonceOffset + 2] = static_cast<unsigned char>((nonce >> 16) & 0xff);
+        blob[nonceOffset + 3] = static_cast<unsigned char>((nonce >> 24) & 0xff);
+
+        randomx_calculate_hash(vm, blob.data(), blob.size(), hashOutput);
+
+        uint256 hash;
+        std::memcpy(hash.data(), hashOutput, HASH_SIZE);
+
+        hashCount++;
+        if ((hashCount & 0x3F) == 0) {  // Every 64 hashes
+            m_sessionHashes += 64;
+            m_totalHashes += 64;
+        }
+
+        // Report the share and KEEP MINING — a pool pays for every share.
+        if (MeetsTarget(hash, target)) {
+            LogPrintf("RandomX: Blob thread %d found share, nonce=%u hash=%s\n",
+                      threadId, nonce, hash.ToString());
+            if (callback) {
+                callback(nonce, hash);
+            }
+        }
+
+        // Yield periodically to prevent UI freeze
+        if ((nonce & 0xFF) == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        nonce++;
+    }
+
+    uint64_t remainingHashes = hashCount & 0x3F;
+    m_totalHashes += remainingHashes;
+    m_sessionHashes += remainingHashes;
+    m_recentHashes += remainingHashes;
 }
 
 void RandomXMiner::MineThread(int threadId, CBlock block, uint256 target,

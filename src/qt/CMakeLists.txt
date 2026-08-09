@@ -138,6 +138,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   utilitydialog.h
   wattxversionchecker.cpp
   wattxversionchecker.h
+  stratumpoolclient.cpp
+  stratumpoolclient.h
   qtumpushbutton.cpp
   qtumpushbutton.h
   qtumhwitool.cpp
