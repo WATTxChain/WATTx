@@ -28,6 +28,10 @@ public:
     QString currentVersion() const { return m_current_str; }
     //! True when the running build was made at a release tag and can be compared.
     bool isReleaseBuild() const { return !m_current.isNull(); }
+    //! False when this build's Qt has no HTTP support (the static release Qt is
+    //! built -no-feature-http -no-openssl). checkForUpdates() then reports an
+    //! unsupported check and the UI should offer the releases page instead.
+    bool supported() const;
 
     //! Query GitHub for the newest release. manual=true for a user-triggered
     //! check (the caller then reports errors and "up to date" too).

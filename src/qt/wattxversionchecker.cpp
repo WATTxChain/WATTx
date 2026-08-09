@@ -29,8 +29,25 @@ WattxVersionChecker::WattxVersionChecker(QObject* parent)
     m_current = ParseReleaseTag(m_current_str);
 }
 
+bool WattxVersionChecker::supported() const
+{
+#if QT_CONFIG(http)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void WattxVersionChecker::checkForUpdates(bool manual)
 {
+#if !QT_CONFIG(http)
+    // The static release Qt is built -no-feature-http -no-openssl: there is no
+    // HTTP stack to ask GitHub with. Report it so the UI can open the releases
+    // page instead of showing a meaningless network error.
+    Q_EMIT checkFinished(manual, false, false, QString(),
+                         QStringLiteral(WATTX_RELEASES_URL),
+                         tr("this build cannot check over the network"));
+#else
     QNetworkRequest request(QUrl("https://api.github.com/repos/WATTxChain/WATTx/releases/latest"));
     request.setRawHeader("Accept", "application/vnd.github+json");
     request.setRawHeader("User-Agent", "WATTx-Qt");
@@ -62,4 +79,5 @@ void WattxVersionChecker::checkForUpdates(bool manual)
         const bool update_available = !m_current.isNull() && latest > m_current;
         Q_EMIT checkFinished(manual, true, update_available, tag, url, QString());
     });
+#endif // QT_CONFIG(http)
 }

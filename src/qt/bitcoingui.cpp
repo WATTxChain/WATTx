@@ -805,8 +805,10 @@ void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndH
     {
         // Check for a newer release in the background: once shortly after
         // startup, then daily. A manual check is always available from the
-        // Help menu regardless of this option.
-        if (_clientModel->getOptionsModel()->getCheckForUpdates()) {
+        // Help menu regardless of this option. Builds whose Qt has no HTTP
+        // stack (the static release Qt) skip the background check entirely.
+        if (m_version_checker->supported() &&
+            _clientModel->getOptionsModel()->getCheckForUpdates()) {
             QTimer::singleShot(3000, m_version_checker, [this] { m_version_checker->checkForUpdates(/*manual=*/false); });
             QTimer* update_timer = new QTimer(m_version_checker);
             connect(update_timer, &QTimer::timeout, this, [this] {
@@ -1170,7 +1172,11 @@ void BitcoinGUI::updateCheckFinished(bool manual, bool ok, bool update_available
                                      const QString& error)
 {
     if (!ok) {
-        if (manual) {
+        if (manual && !m_version_checker->supported()) {
+            // No HTTP stack in this build's Qt: the next best "check" is the
+            // releases page itself.
+            QDesktopServices::openUrl(QUrl(release_url));
+        } else if (manual) {
             QMessageBox::warning(this, tr("Check for Updates"),
                                  tr("Could not check for updates: %1").arg(error));
         }
