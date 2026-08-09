@@ -317,8 +317,10 @@ void MiningPage::createPoolControls(QGroupBox *group)
     layout->addWidget(new QLabel(tr("Pool URL:"), this), 0, 0);
     poolUrlEdit = new QLineEdit(this);
     poolUrlEdit->setPlaceholderText(tr("stratum+tcp://pool.example.com:3333"));
-    // The public WATTx pool's RandomX port, so pool mining works out of the box.
-    poolUrlEdit->setText(QStringLiteral("stratum+tcp://pools.wattxchange.app:3433"));
+    // The public WATTx pool's RandomX port, so pool mining works out of the
+    // box. Public ports are 3333-3339; the 34xx range is the pool host's
+    // internal numbering and is not reachable from outside.
+    poolUrlEdit->setText(QStringLiteral("stratum+tcp://pools.wattxchange.app:3333"));
     layout->addWidget(poolUrlEdit, 0, 1);
 
     layout->addWidget(new QLabel(tr("Worker Name:"), this), 1, 0);
