@@ -10,10 +10,12 @@
 #include <anchor/evm_anchor.h>
 #include <interfaces/mining.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <map>
@@ -230,6 +232,18 @@ struct MultiMergedClient {
     // Statistics per chain
     std::unordered_map<std::string, uint64_t> shares_accepted;
     std::unordered_map<std::string, uint64_t> blocks_found;
+
+    // Rolling share window for hashrate estimation: ten one-minute buckets per
+    // chain (a true 600s window). shares_accepted above is the LIFETIME total,
+    // for the dashboard only — reward scoring must never use it: a counter that
+    // never expires divided by a fixed 600s window inflates with uptime, so two
+    // miners with identical hashrate would earn in proportion to how long they
+    // have been connected rather than the work they are doing.
+    struct ShareWindow {
+        std::array<int64_t, 10> minute{};   // epoch-minute stamp of each bucket
+        std::array<uint64_t, 10> count{};
+    };
+    std::unordered_map<std::string, ShareWindow> share_windows;  // chain -> window
     uint64_t shares_rejected{0};
     uint64_t wtx_blocks_found{0};
 
@@ -516,6 +530,22 @@ private:
     // both hold m_hashrate_mutex.
     double m_pool_reward_share{0.0};
     std::string m_excess_redirect_address;
+
+    // Set by RecalculateMinerScores when the set of wallets in the payout split
+    // changes; the hashrate thread then wakes every JobThread so the very next
+    // job commits to a payout coinbase that reflects the change. Without this a
+    // newcomer's blocks pay the STALE split for up to hashrate_update_interval +
+    // job_timeout_seconds — and when no one was scored yet (fresh pool, daemon
+    // restart) the stale split is the template default: 100% to the pool wallet.
+    bool m_payout_set_changed{false};             // guarded by m_hashrate_mutex
+    std::set<std::string> m_last_payout_wallets;  // guarded by m_hashrate_mutex
+
+    // Out-of-band wake for the hashrate/scoring cycle: fired on the first
+    // accepted share from a wallet not yet in m_miner_scores, so a new miner is
+    // scored (and jobs rebuilt) immediately instead of after the interval sleep.
+    std::condition_variable m_rescore_cv;
+    std::mutex m_rescore_mutex;
+    bool m_rescore_now{false};
 
     // Hashrate update thread
     std::thread m_hashrate_thread;

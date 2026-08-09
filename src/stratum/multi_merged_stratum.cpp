@@ -268,6 +268,12 @@ void MultiMergedStratumServer::Stop() {
         cv.notify_all();
     }
 
+    // Wake the hashrate/scoring thread out of its interval wait
+    {
+        std::lock_guard<std::mutex> lk(m_rescore_mutex);
+        m_rescore_cv.notify_all();
+    }
+
     // Close listening sockets
     for (auto& [algo, sock] : m_listen_sockets) {
         if (sock >= 0) {
@@ -645,7 +651,23 @@ void MultiMergedStratumServer::HandleMessage(int client_id, const std::string& m
 
     // ── XMRig / Monero protocol ────────────────────────────────────────────────
     if (method == "login") {
-        std::vector<std::string> params = ParseJsonArray(message, "params");
+        // XMRig sends the login request with `params` as an OBJECT
+        // {"login":"ADDR","pass":"x","agent":"...","algo":["rx/0","cn/0",...]},
+        // NOT an array. ParseJsonArray scans for the first '[' after "params":
+        // and so returns the nested "algo" list — making params[0] == "rx/0"
+        // instead of the miner's address. Every RandomX miner was thus parsed as
+        // having no address; it only ever "worked" because the old code then
+        // silently fell back to the pool wallet (the bug that stole rewards).
+        // Read the named fields directly for the object form, and keep the array
+        // form as a fallback for any proxy that sends params as an array.
+        std::vector<std::string> params;
+        std::string obj_login = ParseJsonString(message, "login");
+        if (!obj_login.empty()) {
+            params = { obj_login, ParseJsonString(message, "pass"),
+                       ParseJsonString(message, "agent") };
+        } else {
+            params = ParseJsonArray(message, "params");
+        }
         HandleLogin(client_id, id, params);
     } else if (method == "submit") {
         std::vector<std::string> params = ParseJsonArray(message, "params");
@@ -2072,6 +2094,16 @@ bool MultiMergedStratumServer::ValidateShare(int client_id, const std::string& j
             it->second->shares_accepted[chain_name]++;
             m_total_shares[chain_name]++;
 
+            // Rolling-window bucket (see MultiMergedClient::ShareWindow): this,
+            // not the lifetime counter above, is what hashrate estimation reads.
+            {
+                auto& win = it->second->share_windows[chain_name];
+                const int64_t min_now = GetTime() / 60;
+                const size_t slot = static_cast<size_t>(min_now % 10);
+                if (win.minute[slot] != min_now) { win.minute[slot] = min_now; win.count[slot] = 0; }
+                win.count[slot]++;
+            }
+
             // Record the RAW contribution (wallet + source IP) toward WATTx
             // scoring. The 50% cap is NOT applied here anymore: dropping shares
             // above 50% would erase the very excess we must divert to the pool.
@@ -2446,9 +2478,26 @@ void MultiMergedStratumServer::HashrateUpdateThread() {
         UpdateMinerHashrates();
         RecalculateMinerScores();
 
-        // Sleep for update interval
-        std::this_thread::sleep_for(
-            std::chrono::seconds(m_config.hashrate_update_interval));
+        // Payout membership changed: rebuild every algo's job immediately so
+        // the next block's coinbase reflects it, instead of leaving up to
+        // job_timeout_seconds of blocks paying the stale split (for a fresh
+        // pool that stale split is the template default — 100% to the pool).
+        bool payout_changed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_hashrate_mutex);
+            payout_changed = m_payout_set_changed;
+            m_payout_set_changed = false;
+        }
+        if (payout_changed) {
+            for (auto& [algo, cv] : m_job_cvs) cv.notify_all();
+        }
+
+        // Sleep for the update interval — or until RecordMinerShare sees a
+        // wallet that is not scored yet and wakes us to fold it in now.
+        std::unique_lock<std::mutex> lk(m_rescore_mutex);
+        m_rescore_cv.wait_for(lk, std::chrono::seconds(m_config.hashrate_update_interval),
+                              [this] { return m_rescore_now || !m_running.load(); });
+        m_rescore_now = false;
     }
 }
 
@@ -2477,23 +2526,13 @@ void MultiMergedStratumServer::UpdateCoinHashrates() {
         }
 
         // Calculate pool hashrate from recent shares
-        uint64_t time_window = 600;  // 10 minute window
-        uint64_t recent_shares = m_total_shares[name].load();
-        stats.pool_hashrate = (recent_shares * EffectiveShareDifficulty(name) * 0x100000000ULL) / time_window;
-        stats.pool_shares = recent_shares;
-
-        // Calculate pool's % of network hashrate
-        if (stats.network_hashrate > 0) {
-            stats.pool_nethash_percent = (static_cast<double>(stats.pool_hashrate) /
-                                          static_cast<double>(stats.network_hashrate)) * 100.0;
-        } else {
-            stats.pool_nethash_percent = 0.0;
-        }
+        // Lifetime share count, dashboard display only. pool_hashrate and
+        // pool_nethash_percent are computed in UpdateMinerHashrates() from the
+        // rolling share windows (a lifetime count over a fixed 600s window
+        // inflates without bound).
+        stats.pool_shares = m_total_shares[name].load();
 
         stats.last_update = GetTime();
-
-        LogPrintf("MultiMergedStratum: %s - NetHash: %lu H/s, PoolHash: %lu H/s, Pool%%: %.4f%%\n",
-                  name, stats.network_hashrate, stats.pool_hashrate, stats.pool_nethash_percent);
     }
 }
 
@@ -2507,24 +2546,50 @@ void MultiMergedStratumServer::UpdateMinerHashrates() {
         stats.ip_wallet_hashrates.clear();
     }
 
-    // Aggregate miner hashrates from client shares. shares_accepted counts EVERY
-    // accepted share (including ones above the 50% cap), so this is the RAW
-    // contribution — the cap + excess-to-pool split is applied later in
-    // ComputeRewardSplit. Track by wallet and by source IP together.
-    uint64_t time_window = 600;  // 10 minute window
+    // Aggregate miner hashrates from each client's ROLLING share window (the
+    // shares accepted in the last 600s — NOT the lifetime shares_accepted
+    // counter, which grows forever and would weight miners by uptime instead of
+    // work). The window counts EVERY accepted share (including ones above the
+    // 50% cap), so this is the RAW contribution — the cap + excess-to-pool
+    // split is applied later in ComputeRewardSplit. Track by wallet and by
+    // source IP together.
+    const uint64_t time_window = 600;  // 10 minute window
+    const int64_t min_now = GetTime() / 60;
 
     for (const auto& [client_id, client] : m_clients) {
         if (!client || client->wtx_address.empty()) continue;
 
-        for (const auto& [coin_name, shares] : client->shares_accepted) {
+        for (const auto& [coin_name, win] : client->share_windows) {
             auto stats_it = m_coin_stats.find(coin_name);
             if (stats_it == m_coin_stats.end()) continue;
+
+            uint64_t shares = 0;
+            for (size_t i = 0; i < win.minute.size(); ++i) {
+                if (win.minute[i] > min_now - 10) shares += win.count[i];
+            }
+            if (shares == 0) continue;
 
             // Estimate miner's hashrate: (shares * share_diff * 2^32) / time
             uint64_t miner_hashrate = (shares * EffectiveShareDifficulty(coin_name) * 0x100000000ULL) / time_window;
             stats_it->second.miner_hashrates[client->wtx_address] += miner_hashrate;
             stats_it->second.ip_wallet_hashrates[client->ip_address][client->wtx_address] += miner_hashrate;
         }
+    }
+
+    // Pool hashrate = the sum of the miners' windowed hashrates on each chain.
+    // (Replaces the old m_total_shares-based figure, which had the same
+    // grows-forever flaw; this is also the fallback denominator ComputeRewardSplit
+    // uses when a parent daemon reports no usable network difficulty.)
+    for (auto& [coin_name, stats] : m_coin_stats) {
+        uint64_t pool_hash = 0;
+        for (const auto& [wallet, hashrate] : stats.miner_hashrates) pool_hash += hashrate;
+        stats.pool_hashrate = pool_hash;
+        stats.pool_nethash_percent = stats.network_hashrate > 0
+            ? (static_cast<double>(pool_hash) / static_cast<double>(stats.network_hashrate)) * 100.0
+            : 0.0;
+
+        LogPrintf("MultiMergedStratum: %s - NetHash: %lu H/s, PoolHash: %lu H/s, Pool%%: %.4f%%\n",
+                  coin_name, stats.network_hashrate, stats.pool_hashrate, stats.pool_nethash_percent);
     }
 }
 
@@ -2727,6 +2792,18 @@ void MultiMergedStratumServer::RecalculateMinerScores() {
                   m_pool_reward_share * 100.0,
                   m_excess_redirect_address.empty() ? "(unset!)" : m_excess_redirect_address);
     }
+
+    // If the set of paid wallets changed (miner joined, left, or dropped to
+    // zero), flag it so HashrateUpdateThread rebuilds every algo's job — the
+    // payout coinbase is frozen per job, so only a NEW job can pay the newcomer.
+    std::set<std::string> paid_wallets;
+    for (const auto& [miner_addr, score] : m_miner_scores) {
+        if (score.reward_share > 0.0) paid_wallets.insert(miner_addr);
+    }
+    if (paid_wallets != m_last_payout_wallets) {
+        m_payout_set_changed = true;
+        m_last_payout_wallets = std::move(paid_wallets);
+    }
 }
 
 void MultiMergedStratumServer::RecordMinerShare(const std::string& wtx_address,
@@ -2736,15 +2813,28 @@ void MultiMergedStratumServer::RecordMinerShare(const std::string& wtx_address,
     // Called when a miner submits a valid share. The share counts toward their
     // RAW (uncapped) hashrate on that chain — by wallet and by source IP. The
     // authoritative per-period figures are rebuilt in UpdateMinerHashrates() from
-    // client shares_accepted; these immediate increments keep scoring responsive
-    // between rebuilds. Both maps stay consistent (raw) so ComputeRewardSplit sees
-    // the same picture from either path.
-    std::lock_guard<std::mutex> lock(m_hashrate_mutex);
+    // the clients' rolling share windows; these immediate increments keep scoring
+    // responsive between rebuilds. Both maps stay consistent (raw) so
+    // ComputeRewardSplit sees the same picture from either path.
+    bool unscored_wallet = false;
+    {
+        std::lock_guard<std::mutex> lock(m_hashrate_mutex);
 
-    auto stats_it = m_coin_stats.find(coin_name);
-    if (stats_it != m_coin_stats.end()) {
-        stats_it->second.miner_hashrates[wtx_address] += difficulty;
-        stats_it->second.ip_wallet_hashrates[ip_address][wtx_address] += difficulty;
+        auto stats_it = m_coin_stats.find(coin_name);
+        if (stats_it != m_coin_stats.end()) {
+            stats_it->second.miner_hashrates[wtx_address] += difficulty;
+            stats_it->second.ip_wallet_hashrates[ip_address][wtx_address] += difficulty;
+        }
+        unscored_wallet = (m_miner_scores.find(wtx_address) == m_miner_scores.end());
+    }
+
+    // First share from a wallet that is not in the payout split yet: wake the
+    // scoring cycle NOW. Every block found until the payout coinbase includes
+    // them pays the stale split, so the window has to be as short as possible.
+    if (unscored_wallet) {
+        std::lock_guard<std::mutex> lk(m_rescore_mutex);
+        m_rescore_now = true;
+        m_rescore_cv.notify_all();
     }
 }
 
