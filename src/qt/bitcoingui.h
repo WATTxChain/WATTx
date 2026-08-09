@@ -41,7 +41,7 @@ class HelpMessageDialog;
 class ModalOverlay;
 class TitleBar;
 class NavigationBar;
-class QtumVersionChecker;
+class WattxVersionChecker;
 enum class SynchronizationState;
 
 namespace interfaces {
@@ -162,6 +162,7 @@ private:
     QAction* backupWalletAction = nullptr;
     QAction* changePassphraseAction = nullptr;
     QAction* aboutQtAction = nullptr;
+    QAction* checkForUpdatesAction = nullptr;
     QAction* openRPCConsoleAction = nullptr;
     QAction* openAction = nullptr;
     QAction* showHelpMessageAction = nullptr;
@@ -206,7 +207,7 @@ private:
     ModalOverlay* modalOverlay = nullptr;
 
     ModalOverlay *modalBackupOverlay = nullptr;
-    QtumVersionChecker *qtumVersionChecker = nullptr;
+    WattxVersionChecker *m_version_checker = nullptr;
 
     QMenu* m_network_context_menu = new QMenu(this);
 
@@ -307,6 +308,13 @@ public Q_SLOTS:
     /** Show incoming transaction notification for new token transactions. */
     void incomingTokenTransaction(const QString& date, const QString& amount, const QString& type, const QString& address, const QString& label, const QString& walletName, const QString& title);
 #endif // ENABLE_WALLET
+
+private Q_SLOTS:
+    /** Result of a release-update check: prompt to download when one is
+        available; on a manual check also report errors and "up to date". */
+    void updateCheckFinished(bool manual, bool ok, bool update_available,
+                             const QString& latest_version, const QString& release_url,
+                             const QString& error);
 
 private:
     /** Set the proxy-enabled icon as shown in the UI. */

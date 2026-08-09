@@ -136,8 +136,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   trafficgraphwidget.h
   utilitydialog.cpp
   utilitydialog.h
-  qtumversionchecker.cpp
-  qtumversionchecker.h
+  wattxversionchecker.cpp
+  wattxversionchecker.h
   qtumpushbutton.cpp
   qtumpushbutton.h
   qtumhwitool.cpp

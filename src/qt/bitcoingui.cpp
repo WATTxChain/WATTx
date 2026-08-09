@@ -23,7 +23,7 @@
 #include <rpc/server.h>
 #include <qt/navigationbar.h>
 #include <qt/titlebar.h>
-#include <qt/qtumversionchecker.h>
+#include <qt/wattxversionchecker.h>
 #include <qt/styleSheet.h>
 
 #ifdef ENABLE_WALLET
@@ -57,6 +57,7 @@
 #include <QComboBox>
 #include <QCursor>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDragEnterEvent>
 #include <QInputDialog>
 #include <QKeySequence>
@@ -66,6 +67,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QScreen>
 #include <QSettings>
 #include <QShortcut>
@@ -273,7 +275,8 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         openOptionsDialogWithTab(OptionsDialog::TAB_NETWORK);
     });
 
-    qtumVersionChecker = new QtumVersionChecker(this);
+    m_version_checker = new WattxVersionChecker(this);
+    connect(m_version_checker, &WattxVersionChecker::checkFinished, this, &BitcoinGUI::updateCheckFinished);
     connect(labelBlocksIcon, &GUIUtil::ClickableLabel::clicked, this, &BitcoinGUI::showModalOverlay);
     connect(progressBar, &GUIUtil::ClickableProgressBar::clicked, this, &BitcoinGUI::showModalOverlay);
 
@@ -425,6 +428,8 @@ void BitcoinGUI::createActions()
     aboutQtAction = new QAction(tr("About &Qt"), this);
     aboutQtAction->setStatusTip(tr("Show information about Qt"));
     aboutQtAction->setMenuRole(QAction::AboutQtRole);
+    checkForUpdatesAction = new QAction(tr("Check for &Updates…"), this);
+    checkForUpdatesAction->setStatusTip(tr("Check whether a newer WATTx release is available"));
     optionsAction = new QAction(tr("&Options…"), this);
     optionsAction->setStatusTip(tr("Modify configuration options for %1").arg(CLIENT_NAME));
     optionsAction->setMenuRole(QAction::PreferencesRole);
@@ -510,6 +515,7 @@ void BitcoinGUI::createActions()
     connect(quitAction, &QAction::triggered, this, &BitcoinGUI::quitRequested);
     connect(aboutAction, &QAction::triggered, this, &BitcoinGUI::aboutClicked);
     connect(aboutQtAction, &QAction::triggered, qApp, QApplication::aboutQt);
+    connect(checkForUpdatesAction, &QAction::triggered, this, [this] { m_version_checker->checkForUpdates(/*manual=*/true); });
     connect(optionsAction, &QAction::triggered, this, &BitcoinGUI::optionsClicked);
     connect(showHelpMessageAction, &QAction::triggered, this, &BitcoinGUI::showHelpMessageClicked);
     connect(openRPCConsoleAction, &QAction::triggered, this, &BitcoinGUI::showDebugWindow);
@@ -730,6 +736,8 @@ void BitcoinGUI::createMenuBar()
     QMenu *help = appMenuBar->addMenu(tr("&Help"));
     help->addAction(showHelpMessageAction);
     help->addSeparator();
+    help->addAction(checkForUpdatesAction);
+    help->addSeparator();
     help->addAction(aboutAction);
     help->addAction(aboutQtAction);
 }
@@ -795,12 +803,18 @@ void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndH
     this->clientModel = _clientModel;
     if(_clientModel)
     {
-        // Check for updates
-        if(_clientModel->getOptionsModel()->getCheckForUpdates() && qtumVersionChecker->newVersionAvailable())
-        {
-            QString link = QString("<a href=%1>%2</a>").arg(QTUM_RELEASES, QTUM_RELEASES);
-            QString message(tr("New version of Qtum wallet is available on the Qtum source code repository: <br /> %1. <br />It is recommended to download it and update this application").arg(link));
-            QMessageBox::information(this, tr("Check for updates"), message);
+        // Check for a newer release in the background: once shortly after
+        // startup, then daily. A manual check is always available from the
+        // Help menu regardless of this option.
+        if (_clientModel->getOptionsModel()->getCheckForUpdates()) {
+            QTimer::singleShot(3000, m_version_checker, [this] { m_version_checker->checkForUpdates(/*manual=*/false); });
+            QTimer* update_timer = new QTimer(m_version_checker);
+            connect(update_timer, &QTimer::timeout, this, [this] {
+                if (clientModel && clientModel->getOptionsModel()->getCheckForUpdates()) {
+                    m_version_checker->checkForUpdates(/*manual=*/false);
+                }
+            });
+            update_timer->start(24 * 60 * 60 * 1000);
         }
         // Create system tray menu (or setup the dock menu) that late to prevent users from calling actions,
         // while the client has not yet fully loaded
@@ -1149,6 +1163,55 @@ void BitcoinGUI::aboutClicked()
 
     auto dlg = new HelpMessageDialog(this, /*about=*/true);
     GUIUtil::ShowModalDialogAsynchronously(dlg);
+}
+
+void BitcoinGUI::updateCheckFinished(bool manual, bool ok, bool update_available,
+                                     const QString& latest_version, const QString& release_url,
+                                     const QString& error)
+{
+    if (!ok) {
+        if (manual) {
+            QMessageBox::warning(this, tr("Check for Updates"),
+                                 tr("Could not check for updates: %1").arg(error));
+        }
+        return;
+    }
+
+    if (!update_available) {
+        if (manual) {
+            const QString current = m_version_checker->currentVersion();
+            QMessageBox::information(this, tr("Check for Updates"),
+                m_version_checker->isReleaseBuild()
+                    ? tr("You are running the latest WATTx release (%1).").arg(current)
+                    : tr("You are running a development build (%1); it cannot be compared "
+                         "with releases. The latest release is %2.").arg(current, latest_version));
+        }
+        return;
+    }
+
+    // An automatic check stays quiet about a version the user chose to skip;
+    // a manual check always shows the result.
+    QSettings settings;
+    if (!manual && settings.value("SkippedUpdateVersion").toString() == latest_version) return;
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Information);
+    box.setWindowTitle(tr("Update Available"));
+    box.setText(tr("WATTx %1 is available — you are running %2.")
+                    .arg(latest_version, m_version_checker->currentVersion()));
+    box.setInformativeText(tr("Download the new release, close this application, and replace "
+                              "this installation with the new binaries."));
+    QPushButton* download_button = box.addButton(tr("Download"), QMessageBox::AcceptRole);
+    box.addButton(tr("Remind Me Later"), QMessageBox::RejectRole);
+    QPushButton* skip_button = box.addButton(tr("Skip This Version"), QMessageBox::DestructiveRole);
+    box.setDefaultButton(download_button);
+    box.exec();
+
+    if (box.clickedButton() == download_button) {
+        QDesktopServices::openUrl(QUrl(release_url));
+    } else if (box.clickedButton() == skip_button) {
+        settings.setValue("SkippedUpdateVersion", latest_version);
+    }
 }
 
 void BitcoinGUI::showDebugWindow()
